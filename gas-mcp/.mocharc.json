@@ -1,0 +1,9 @@
+{
+  "loader": "ts-node/esm",
+  "extensions": ["ts"],
+  "require": ["test/setup/globalAuth.ts"],
+  "timeout": 15000,
+  "exit": true,
+  "reporter": "spec",
+  "color": true
+} 

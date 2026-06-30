@@ -1,0 +1,396 @@
+import { ValidationError } from '../errors/mcpErrors.js';
+
+/**
+ * Parsed path information for GAS operations
+ */
+export interface ParsedPath {
+  scriptId: string;
+  filename?: string;
+  directory?: string;
+  pattern?: string;        // NEW: wildcard pattern if detected
+  isProject: boolean;
+  isFile: boolean;
+  isDirectory: boolean;
+  isWildcard: boolean;     // NEW: true if contains wildcards
+  wildcardType: 'none' | 'simple' | 'complex';  // NEW: wildcard complexity
+}
+
+/**
+ * File type mapping for Google Apps Script
+ */
+export const FILE_TYPE_MAP: Record<string, string> = {
+  '.gs': 'SERVER_JS',
+  '.ts': 'SERVER_JS',
+  '.html': 'HTML',
+  '.json': 'JSON'
+};
+
+/**
+ * Regex cache for wildcard patterns (performance optimization)
+ */
+const regexCache = new Map<string, RegExp>();
+
+/**
+ * Check if a pattern contains wildcard characters
+ */
+export function isWildcardPattern(pattern: string): boolean {
+  return pattern.includes('*') || pattern.includes('?');
+}
+
+/**
+ * Convert wildcard pattern to JavaScript RegExp
+ * Supports: * (any chars), ? (single char), literal characters
+ */
+export function wildcardToRegex(pattern: string): RegExp {
+  // Escape special regex characters except * and ?
+  const escaped = pattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')  // Escape regex special chars
+    .replace(/\*/g, '.*')                   // * becomes .*
+    .replace(/\?/g, '.');                   // ? becomes .
+  
+  return new RegExp(`^${escaped}$`, 'i');  // Case-insensitive, full match
+}
+
+/**
+ * Get cached regex for pattern (performance optimization)
+ */
+export function getCachedRegex(pattern: string): RegExp {
+  if (!regexCache.has(pattern)) {
+    regexCache.set(pattern, wildcardToRegex(pattern));
+  }
+  return regexCache.get(pattern)!;
+}
+
+/**
+ * Validate wildcard patterns for safety
+ */
+export function validateWildcardPattern(pattern: string): { valid: boolean; error?: string } {
+  try {
+    // Test regex compilation
+    wildcardToRegex(pattern);
+    
+    // Check for potentially expensive patterns
+    const wildcardCount = (pattern.match(/[*?]/g) || []).length;
+    if (wildcardCount > 10) {
+      return { valid: false, error: 'Too many wildcards (max 10)' };
+    }
+    
+    // Check for invalid consecutive wildcards
+    if (/\*+\*/.test(pattern)) {
+      return { valid: false, error: 'Invalid pattern: consecutive wildcards' };
+    }
+    
+    return { valid: true };
+  } catch (error) {
+    return { valid: false, error: `Invalid wildcard pattern: ${error}` };
+  }
+}
+
+/**
+ * Determine wildcard pattern complexity
+ */
+export function getPatternComplexity(pattern: string): 'simple' | 'medium' | 'complex' {
+  if (!isWildcardPattern(pattern)) return 'simple';
+  
+  const wildcardCount = (pattern.match(/[*?]/g) || []).length;
+  const hasDirectoryWildcards = /[*?].*\/|\/.*[*?]/.test(pattern);
+  
+  if (wildcardCount === 1 && !hasDirectoryWildcards) return 'simple';
+  if (wildcardCount <= 3 && !hasDirectoryWildcards) return 'medium';
+  return 'complex';
+}
+
+/**
+ * Enhanced directory/pattern matching with wildcard support
+ */
+export function matchesPattern(filename: string, pattern: string): boolean {
+  if (!pattern) return true;
+  
+  // If no wildcards, use simple prefix matching (faster)
+  if (!isWildcardPattern(pattern)) {
+    const normalizedPattern = pattern.endsWith('/') ? pattern : pattern + '/';
+    return filename.startsWith(normalizedPattern);
+  }
+  
+  // Validate pattern before using
+  const validation = validateWildcardPattern(pattern);
+  if (!validation.valid) {
+    console.error(`Invalid wildcard pattern "${pattern}": ${validation.error}`);
+    return false;
+  }
+  
+  // Wildcard pattern matching
+  const regex = getCachedRegex(pattern);
+  return regex.test(filename);
+}
+
+/**
+ * REMOVED: No longer manipulating filenames or adding extensions
+ * Files are used exactly as provided by the user
+ */
+
+/**
+ * Get file type from extension - simplified, no manipulation
+ */
+export function getFileType(filename: string): string {
+  // Special handling for Google Apps Script manifest files
+  const baseName = getBaseName(filename);
+  if (baseName === 'appsscript') {
+    return 'JSON';
+  }
+
+  // If no extension, default to SERVER_JS
+  if (!filename.includes('.')) {
+    return 'SERVER_JS';
+  }
+
+  const ext = filename.substring(filename.lastIndexOf('.'));
+  const type = FILE_TYPE_MAP[ext.toLowerCase()];
+  if (!type) {
+    throw new ValidationError('extension', ext, `valid file extension (${Object.keys(FILE_TYPE_MAP).join(', ')})`);
+  }
+  return type;
+}
+
+/**
+ * Parse a path in the format: "" | "scriptId" | "scriptId/path/to/file[.ext]"
+ * Files can have extensions or not - extensions will be inferred from context
+ * Now supports wildcard patterns with * and ? characters
+ */
+export function parsePath(path: string): ParsedPath {
+  // Empty path = list all projects
+  if (!path || path === '') {
+    return {
+      scriptId: '',
+      isProject: false,
+      isFile: false,
+      isDirectory: true,
+      isWildcard: false,
+      wildcardType: 'none'
+    };
+  }
+
+  const parts = path.split('/').filter(part => part.length > 0);
+  const scriptId = parts[0];
+
+  // Validate script ID format (Google Drive file IDs are typically 25-60 characters, but allow up to 100)
+  if (!/^[a-zA-Z0-9_-]{25,100}$/.test(scriptId)) {
+    throw new ValidationError('scriptId', scriptId, 'valid Google Apps Script project ID (25-100 characters, alphanumeric, _, -)');
+  }
+
+  // Check for wildcard patterns in the entire path
+  const hasWildcards = isWildcardPattern(path);
+  
+  if (hasWildcards) {
+    // Extract pattern (everything after scriptId)
+    const pattern = parts.slice(1).join('/');
+    const wildcardComplexity = getPatternComplexity(pattern);
+    
+    // Validate wildcard pattern
+    const validation = validateWildcardPattern(pattern);
+    if (!validation.valid) {
+      throw new ValidationError('pattern', pattern, validation.error || 'invalid wildcard pattern');
+    }
+    
+    return {
+      scriptId,
+      pattern,
+      isProject: false,
+      isFile: false,
+      isDirectory: false,
+      isWildcard: true,
+      wildcardType: wildcardComplexity === 'simple' ? 'simple' : 'complex'
+    };
+  }
+
+  // Just script ID = list files in project
+  if (parts.length === 1) {
+    return {
+      scriptId,
+      isProject: true,
+      isFile: false,
+      isDirectory: false,
+      isWildcard: false,
+      wildcardType: 'none'
+    };
+  }
+
+  // Multiple parts = could be file or directory
+  const lastPart = parts[parts.length - 1];
+  const filename = parts.slice(1).join('/');
+  const directory = parts.length > 2 ? parts.slice(1, -1).join('/') : undefined;
+
+  // Validate filename length (GAS has file size limits)
+  if (filename.length > 100) {
+    throw new ValidationError('filename', filename, 'filename under 100 characters');
+  }
+
+  // Determine if this looks like a file or directory
+  //
+  // IMPORTANT: GAS has NO real directories - all "directories" are just filename prefixes.
+  // However, for backward compatibility with tools that list "directories", we need to
+  // distinguish between:
+  //   - File paths: scriptId/common-js/require, scriptId/models/User.gs
+  //   - Directory-like paths: scriptId/models, scriptId/utils (for listing operations)
+  //
+  // Consider it a file if:
+  // 1. It has a known extension (.gs, .ts, .html, .json)
+  // 2. It has any extension (contains a dot)
+  // 3. It looks like a code file (starts with uppercase or contains camelCase)
+  // 4. It's a special Google Apps Script file (appsscript manifest or Code)
+  // 5. The path contains a "/" in the filename part (e.g., common-js/require)
+  //    This indicates a file with a directory-like prefix, not a directory listing
+  const hasKnownExtension = /\.(gs|ts|html|json)$/i.test(lastPart);
+  const hasAnyExtension = lastPart.includes('.');
+  const looksLikeCodeFile = /^[A-Z]/.test(lastPart) || /[a-z][A-Z]/.test(lastPart);
+  const isSpecialGASFile = lastPart === 'appsscript' || lastPart === 'Code';
+  const hasDirectoryPrefix = filename.includes('/');  // NEW: Files like "common-js/require"
+
+  const isFile = hasKnownExtension || hasAnyExtension || looksLikeCodeFile || isSpecialGASFile || hasDirectoryPrefix;
+
+  if (isFile) {
+    return {
+      scriptId,
+      filename,
+      directory,
+      isProject: false,
+      isFile: true,
+      isDirectory: false,
+      isWildcard: false,
+      wildcardType: 'none'
+    };
+  } else {
+    // Treat as directory
+    return {
+      scriptId,
+      directory: filename,
+      isProject: false,
+      isFile: false,
+      isDirectory: true,
+      isWildcard: false,
+      wildcardType: 'none'
+    };
+  }
+}
+
+/**
+ * Extract directory from a file path
+ */
+export function getDirectory(filename: string): string | undefined {
+  const lastSlash = filename.lastIndexOf('/');
+  return lastSlash > 0 ? filename.substring(0, lastSlash) : undefined;
+}
+
+/**
+ * Get just the filename without directory
+ */
+export function getBaseName(filename: string): string {
+  const lastSlash = filename.lastIndexOf('/');
+  return lastSlash >= 0 ? filename.substring(lastSlash + 1) : filename;
+}
+
+/**
+ * Strip file extension from a filename (handles .gs, .html, .json)
+ * E.g., "common-js/require.gs" -> "common-js/require"
+ */
+export function stripExtension(filename: string): string {
+  return filename.replace(/\.(gs|js|html|json)$/, '');
+}
+
+/**
+ * Check if a file name matches a base name (with or without extension)
+ * Useful for comparing file names when the actual file may have .gs/.html/.json extension
+ * E.g., fileNameMatches("common-js/__mcp_exec.gs", "common-js/__mcp_exec") -> true
+ */
+export function fileNameMatches(actualName: string, baseName: string): boolean {
+  // Direct match
+  if (actualName === baseName) return true;
+  // Match after stripping extension
+  if (stripExtension(actualName) === baseName) return true;
+  // GAS-native file (no extension), user provided extension in baseName
+  return actualName === stripExtension(baseName);
+}
+
+/**
+ * Join path components safely
+ */
+export function joinPath(scriptId: string, ...parts: string[]): string {
+  const filteredParts = parts.filter(part => part && part.length > 0);
+  return [scriptId, ...filteredParts].join('/');
+}
+
+/**
+ * Check if a filename matches a directory filter (backward compatibility)
+ * Now supports wildcard patterns via matchesPattern
+ */
+export function matchesDirectory(filename: string, directory: string): boolean {
+  return matchesPattern(filename, directory);
+}
+
+/**
+ * Sort files for GAS execution order (dependencies first)
+ */
+export function sortFilesForExecution<T extends { name: string; order?: number }>(files: T[]): T[] {
+  // ✅ PRESERVE API ORDER: Don't sort - respect the order returned by the API
+  // The Google Apps Script API should maintain file order after updateContent operations
+  return files;
+}
+
+/**
+ * Hybrid script ID resolution for tools that support both scriptId parameter and path-embedded script IDs
+ */
+export interface HybridPathResolution {
+  scriptId: string;
+  cleanPath: string;  // Path without embedded script ID
+  wasEmbedded: boolean;  // True if script ID came from path, false if from parameter
+}
+
+/**
+ * Resolve script ID from either scriptId parameter or path-embedded script ID
+ * 
+ * @param scriptId - The scriptId parameter (can be empty string to force path extraction)
+ * @param path - The path that may contain embedded script ID
+ * @param operation - Operation name for error messages
+ * @returns Resolved script ID and clean path
+ * 
+ * Resolution logic:
+ * 1. If scriptId provided → use scriptId, treat path as clean filename/path (no script ID prefix expected)
+ * 2. If scriptId empty and path has embedded script ID → use embedded script ID
+ * 3. If scriptId empty and path has no embedded script ID → throw error
+ */
+export function resolveHybridScriptId(
+  scriptId: string | undefined, 
+  path: string, 
+  operation: string = 'operation'
+): HybridPathResolution {
+  // Case 1: scriptId provided → use it, treat path as clean
+  if (scriptId && scriptId.trim()) {
+    // Validate scriptId format (Google Drive file IDs are typically 25-60 characters, but allow up to 100)
+    if (!/^[a-zA-Z0-9_-]{25,100}$/.test(scriptId)) {
+      throw new ValidationError('scriptId', scriptId, 'valid Google Apps Script project ID (25-100 characters, alphanumeric, _, -)');
+    }
+    
+    return {
+      scriptId: scriptId,
+      cleanPath: path,
+      wasEmbedded: false
+    };
+  }
+  
+  // Case 2: scriptId empty, check if path has embedded script ID
+  const parsedPath = parsePath(path);
+  if (parsedPath.scriptId) {
+    return {
+      scriptId: parsedPath.scriptId,
+      cleanPath: parsedPath.filename || parsedPath.directory || parsedPath.pattern || '',
+      wasEmbedded: true
+    };
+  }
+  
+  // Case 3: Both scriptId empty and no embedded script ID → error
+  throw new ValidationError(
+    'scriptId', 
+    'missing', 
+    `Either provide scriptId parameter or embed script ID in path (e.g., "scriptId/filename") for ${operation}`
+  );
+}
